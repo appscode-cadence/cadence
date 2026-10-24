@@ -30,6 +30,8 @@ import (
 	"go.uber.org/yarpc"
 	"go.uber.org/yarpc/api/middleware"
 	"go.uber.org/yarpc/api/transport"
+	"go.uber.org/yarpc/peer"
+	"go.uber.org/yarpc/peer/hostport"
 	"go.uber.org/yarpc/transport/grpc"
 	"go.uber.org/yarpc/transport/tchannel"
 
@@ -110,6 +112,7 @@ func (b multiOutboundsBuilder) Build(grpc *grpc.Transport, tchannel *tchannel.Tr
 type publicClientOutbound struct {
 	address        string
 	isGRPC         bool
+	tlsConfig      *tls.Config
 	authMiddleware middleware.UnaryOutbound
 }
 
@@ -131,12 +134,23 @@ func newPublicClientOutbound(config *config.Config) (publicClientOutbound, error
 
 	isGrpc := config.PublicClient.Transport == grpc.TransportName
 
-	return publicClientOutbound{config.PublicClient.HostPort, isGrpc, authMiddleware}, nil
+	tlsConfig, err := config.PublicClient.TLS.ToTLSConfig()
+	if err != nil {
+		return publicClientOutbound{}, fmt.Errorf("public client TLS config: %v", err)
+	}
+	if tlsConfig != nil && !isGrpc {
+		return publicClientOutbound{}, fmt.Errorf("public client TLS is only supported with grpc transport")
+	}
+
+	return publicClientOutbound{config.PublicClient.HostPort, isGrpc, tlsConfig, authMiddleware}, nil
 }
 
 func (b publicClientOutbound) Build(grpc *grpc.Transport, tchannel *tchannel.Transport) (*Outbounds, error) {
 	var outbound transport.UnaryOutbound
-	if b.isGRPC {
+	if b.isGRPC && b.tlsConfig != nil {
+		// NewSingleOutbound does not support TLS, so dial through a TLS dialer instead
+		outbound = grpc.NewOutbound(peer.NewSingle(hostport.Identify(b.address), createDialer(grpc, b.tlsConfig)))
+	} else if b.isGRPC {
 		outbound = grpc.NewSingleOutbound(b.address)
 	} else {
 		outbound = tchannel.NewSingleOutbound(b.address)

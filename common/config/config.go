@@ -513,6 +513,9 @@ type (
 		Transport string `yaml:"transport"`
 		// interval to refresh DNS. Default to 10s
 		RefreshInterval time.Duration `yaml:"RefreshInterval"`
+		// TLS configures client TLS/SSL for connections to the frontend.
+		// Only supported with grpc transport.
+		TLS TLS `yaml:"tls"`
 	}
 
 	// ShardDistributorClient contains the config items for shard distributor
