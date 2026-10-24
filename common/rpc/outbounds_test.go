@@ -21,18 +21,32 @@
 package rpc
 
 import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io/ioutil"
+	"math/big"
+	"net"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/yarpc"
 	"go.uber.org/yarpc/api/peer"
 	"go.uber.org/yarpc/api/transport"
+	"go.uber.org/yarpc/encoding/raw"
 	"go.uber.org/yarpc/peer/direct"
 	"go.uber.org/yarpc/transport/grpc"
 	"go.uber.org/yarpc/transport/tchannel"
+	"google.golang.org/grpc/credentials"
 
 	"github.com/uber/cadence/common/config"
 	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
@@ -128,6 +142,154 @@ func TestPublicClientOutbound(t *testing.T) {
 	outbounds := o.Outbounds
 	assert.Equal(t, outbounds[OutboundPublicClient].ServiceName, service.Frontend)
 	assert.NotNil(t, outbounds[OutboundPublicClient].Unary)
+}
+
+func TestPublicClientOutboundTLSConfig(t *testing.T) {
+	makeConfig := func(transport string, tls config.TLS) *config.Config {
+		return &config.Config{
+			PublicClient: config.PublicClient{HostPort: "localhost:1234", Transport: transport, TLS: tls},
+		}
+	}
+
+	builder, err := newPublicClientOutbound(makeConfig("grpc", config.TLS{}))
+	require.NoError(t, err)
+	assert.Nil(t, builder.tlsConfig)
+
+	_, err = newPublicClientOutbound(makeConfig("tchannel", config.TLS{Enabled: true}))
+	require.EqualError(t, err, "public client TLS is only supported with grpc transport")
+
+	_, err = newPublicClientOutbound(makeConfig("grpc", config.TLS{Enabled: true, CaFile: "invalid"}))
+	require.EqualError(t, err, "public client TLS config: open invalid: no such file or directory")
+
+	builder, err = newPublicClientOutbound(makeConfig("grpc", config.TLS{Enabled: true}))
+	require.NoError(t, err)
+	assert.NotNil(t, builder.tlsConfig)
+}
+
+func TestPublicClientOutboundTLSHandshake(t *testing.T) {
+	certs := newTestCerts(t)
+	serverTLS, err := config.TLS{
+		Enabled:           true,
+		CertFile:          certs.serverCert,
+		KeyFile:           certs.serverKey,
+		CaFile:            certs.ca,
+		RequireClientAuth: true,
+	}.ToTLSConfig()
+	require.NoError(t, err)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	serverTransport := grpc.NewTransport()
+	server := yarpc.NewDispatcher(yarpc.Config{
+		Name:     service.Frontend,
+		Inbounds: yarpc.Inbounds{serverTransport.NewInbound(listener, grpc.InboundCredentials(credentials.NewTLS(serverTLS)))},
+	})
+	server.Register(raw.Procedure("echo", func(_ context.Context, body []byte) ([]byte, error) {
+		return body, nil
+	}))
+	require.NoError(t, server.Start())
+	defer server.Stop()
+
+	call := func(clientTLS config.TLS) ([]byte, error) {
+		builder, err := newPublicClientOutbound(&config.Config{
+			PublicClient: config.PublicClient{HostPort: listener.Addr().String(), Transport: "grpc", TLS: clientTLS},
+		})
+		require.NoError(t, err)
+
+		clientTransport := grpc.NewTransport()
+		tchannelTransport, err := tchannel.NewTransport(tchannel.ServiceName("test"))
+		require.NoError(t, err)
+		outbounds, err := builder.Build(clientTransport, tchannelTransport)
+		require.NoError(t, err)
+
+		client := yarpc.NewDispatcher(yarpc.Config{Name: "test-client", Outbounds: outbounds.Outbounds})
+		require.NoError(t, client.Start())
+		defer client.Stop()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return raw.New(client.ClientConfig(OutboundPublicClient)).Call(ctx, "echo", []byte("hello"))
+	}
+
+	// mutual TLS with host verification succeeds
+	resp, err := call(config.TLS{
+		Enabled:                true,
+		CertFile:               certs.clientCert,
+		KeyFile:                certs.clientKey,
+		CaFile:                 certs.ca,
+		EnableHostVerification: true,
+		ServerName:             "localhost",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []byte("hello"), resp)
+
+	// without client certificate the server rejects the handshake
+	_, err = call(config.TLS{Enabled: true, CaFile: certs.ca, EnableHostVerification: true, ServerName: "localhost"})
+	assert.Error(t, err)
+
+	// plaintext client cannot talk to a TLS-only server
+	_, err = call(config.TLS{})
+	assert.Error(t, err)
+}
+
+type testCerts struct {
+	ca, serverCert, serverKey, clientCert, clientKey string
+}
+
+// newTestCerts writes a CA plus a server ("localhost") and a client certificate, all signed by the CA.
+func newTestCerts(t *testing.T) testCerts {
+	dir := t.TempDir()
+	write := func(name string, typ string, der []byte) string {
+		path := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: typ, Bytes: der}), 0o600))
+		return path
+	}
+
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	require.NoError(t, err)
+	caCert, err := x509.ParseCertificate(caDER)
+	require.NoError(t, err)
+
+	leaf := func(serial int64, usage x509.ExtKeyUsage) ([]byte, []byte) {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		require.NoError(t, err)
+		template := &x509.Certificate{
+			SerialNumber: big.NewInt(serial),
+			Subject:      pkix.Name{CommonName: "localhost"},
+			DNSNames:     []string{"localhost"},
+			IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     time.Now().Add(time.Hour),
+			KeyUsage:     x509.KeyUsageDigitalSignature,
+			ExtKeyUsage:  []x509.ExtKeyUsage{usage},
+		}
+		der, err := x509.CreateCertificate(rand.Reader, template, caCert, &key.PublicKey, caKey)
+		require.NoError(t, err)
+		keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+		require.NoError(t, err)
+		return der, keyDER
+	}
+	serverDER, serverKeyDER := leaf(2, x509.ExtKeyUsageServerAuth)
+	clientDER, clientKeyDER := leaf(3, x509.ExtKeyUsageClientAuth)
+
+	return testCerts{
+		ca:         write("ca.crt", "CERTIFICATE", caDER),
+		serverCert: write("server.crt", "CERTIFICATE", serverDER),
+		serverKey:  write("server.key", "PRIVATE KEY", serverKeyDER),
+		clientCert: write("client.crt", "CERTIFICATE", clientDER),
+		clientKey:  write("client.key", "PRIVATE KEY", clientKeyDER),
+	}
 }
 
 func TestCrossDCOutbounds(t *testing.T) {
